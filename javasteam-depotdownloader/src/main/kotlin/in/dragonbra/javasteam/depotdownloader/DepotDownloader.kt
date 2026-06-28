@@ -58,6 +58,8 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import okio.Buffer
@@ -70,6 +72,8 @@ import org.apache.commons.lang3.SystemUtils
 import java.io.Closeable
 import java.io.File
 import java.io.IOException
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.lang.IllegalStateException
 import java.time.Instant
@@ -126,6 +130,8 @@ class DepotDownloader @JvmOverloads constructor(
     private val parentJob: Job? = null,
     private val autoStartDownload: Boolean = true,
     private val filesystem: BaseCaseInsensitiveFileSystem = SimpleFileSystem(),
+    private val stagingRoot: Path? = null,
+    private val maxStagingBytes: Long = 1L shl 30,
 ) : Closeable {
 
     companion object {
@@ -172,6 +178,8 @@ class DepotDownloader @JvmOverloads constructor(
 
     private val pendingChunks = AtomicInteger(0)
 
+    private val stagingBudget: ByteBudget? = stagingRoot?.let { ByteBudget(maxStagingBytes) }
+
     private var chunkProcessingJob: Job? = null
     private var decompressJob: Job? = null
 
@@ -208,6 +216,7 @@ class DepotDownloader @JvmOverloads constructor(
         val fileStreamData: FileStreamData,
         val chunk: ChunkData,
         val fileId: String,
+        val workDir: Path,
     )
 
     private data class DirectoryResult(val success: Boolean, val installDir: Path?)
@@ -228,6 +237,43 @@ class DepotDownloader @JvmOverloads constructor(
         var filesToDownload: HashSet<String> = hashSetOf(),
         var verifyAll: Boolean = false,
     )
+
+    private class ByteBudget(private val capacity: Long) {
+        private val mutex = Mutex()
+        private var used = 0L
+        private val waiters = ArrayDeque<Pair<Long, CompletableDeferred<Unit>>>()
+
+        suspend fun acquire(n: Long) {
+            val deferred = mutex.withLock {
+                if (used == 0L || used + n <= capacity) {
+                    used += n
+                    null
+                } else {
+                    val d = CompletableDeferred<Unit>()
+                    waiters.addLast(n to d)
+                    d
+                }
+            }
+            deferred?.await()
+        }
+
+        suspend fun release(n: Long) {
+            mutex.withLock {
+                used -= n
+                if (used < 0L) used = 0L
+                while (waiters.isNotEmpty()) {
+                    val (need, d) = waiters.first()
+                    if (used == 0L || used + need <= capacity) {
+                        used += need
+                        waiters.removeFirst()
+                        d.complete(Unit)
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+    }
 
     // endregion
 
@@ -1001,7 +1047,6 @@ class DepotDownloader @JvmOverloads constructor(
                 logger?.debug("Already have manifest $manifestIdStr for depot ${depot.depotId}.")
             } else {
                 logger?.debug("Downloading depot ${depot.depotId} manifest")
-                notifyListeners { it.onStatusUpdate("Downloading manifest for depot ${depot.depotId}") }
 
                 var manifestRequestCode: ULong = 0U
                 var manifestRequestCodeExpiration = Instant.MIN
@@ -1118,6 +1163,15 @@ class DepotDownloader @JvmOverloads constructor(
 
         val stagingDir = depot.installDir / STAGING_DIR
 
+        val workDir = if (stagingRoot != null) {
+            (stagingRoot / depot.depotId.toString()).also {
+                filesystem.createDirectories(it)
+                filesystem.createDirectories(it / STAGING_DIR)
+            }
+        } else {
+            depot.installDir
+        }
+
         val filesAfterExclusions = coroutineScope {
             newManifest.files.filter { file ->
                 async { testIsFileIncluded(file.fileName) }.await()
@@ -1153,6 +1207,7 @@ class DepotDownloader @JvmOverloads constructor(
             depotDownloadInfo = depot,
             depotCounter = depotCounter,
             stagingDir = stagingDir,
+            workDir = workDir,
             manifest = newManifest,
             previousManifest = oldManifest,
             filteredFiles = filesAfterExclusions.toMutableList(),
@@ -1297,11 +1352,15 @@ class DepotDownloader @JvmOverloads constructor(
             filesystem.delete(fileStagingPath)
         }
 
+        if (stagingRoot != null) {
+            downloadDepotFileStaged(downloadCounter, depotFilesData, file)
+            return@withContext
+        }
+
         var neededChunks: MutableList<ChunkData>? = null
         val fileDidExist = filesystem.exists(fileFinalPath)
         if (!fileDidExist) {
             logger?.debug("Pre-allocating: $fileFinalPath")
-            notifyListeners { it.onStatusUpdate("Allocating file: ${file.fileName}") }
 
             // create new file. need all chunks
             try {
@@ -1421,7 +1480,6 @@ class DepotDownloader @JvmOverloads constructor(
 
             filesystem.openReadOnly(fileFinalPath).use { handle ->
                 logger?.debug("Validating $fileFinalPath")
-                notifyListeners { it.onStatusUpdate("Validating: ${file.fileName}") }
 
                 neededChunks = Util.validateSteam3FileChecksums(
                     handle = handle,
@@ -1507,6 +1565,90 @@ class DepotDownloader @JvmOverloads constructor(
                     fileId = fileId,
                 )
             )
+        }
+    }
+
+    private suspend fun downloadDepotFileStaged(
+        downloadCounter: GlobalDownloadCounter,
+        depotFilesData: DepotFilesData,
+        file: FileData,
+    ) = withContext(Dispatchers.IO) {
+        ensureActive()
+
+        val depot = depotFilesData.depotDownloadInfo
+        val depotDownloadCounter = depotFilesData.depotCounter
+        val fileFinalPath = depot.installDir / file.fileName
+        val fileWorkPath = depotFilesData.workDir / file.fileName
+
+        if (filesystem.exists(fileFinalPath) &&
+            (filesystem.metadata(fileFinalPath).size ?: -1L) == file.totalSize
+        ) {
+            logger?.debug("File $fileFinalPath already finalized on external storage, skipping")
+            val finalizePct = synchronized(depotDownloadCounter) {
+                depotDownloadCounter.sizeDownloaded += file.totalSize
+                depotDownloadCounter.bytesFinalized += file.totalSize
+                if (depotDownloadCounter.completeDownloadSize > 0L) {
+                    depotDownloadCounter.bytesFinalized.toFloat() / depotDownloadCounter.completeDownloadSize
+                } else {
+                    1f
+                }
+            }
+            synchronized(downloadCounter) { downloadCounter.completeDownloadSize -= file.totalSize }
+            notifyListeners { it.onFileFinalized(depot.depotId, finalizePct.coerceIn(0f, 1f)) }
+            return@withContext
+        }
+
+        stagingBudget?.acquire(file.totalSize)
+        var releaseOnExit = true
+        try {
+            if (filesystem.exists(fileWorkPath)) {
+                filesystem.delete(fileWorkPath)
+            }
+            filesystem.createDirectories(fileWorkPath.parent!!)
+
+            try {
+                RandomAccessFile(fileWorkPath.toResolvedFile(), "rw").use { it.setLength(file.totalSize) }
+            } catch (e: IOException) {
+                throw DepotDownloaderException("Failed to allocate work file $fileWorkPath: ${e.message}")
+            }
+
+            val neededChunks = ArrayList(file.chunks)
+
+            val fileStreamData = FileStreamData(
+                fileHandle = null,
+                fileLock = Mutex(),
+                chunksDownloaded = AtomicInteger(0),
+                chunksToDownload = AtomicInteger(neededChunks.size),
+            )
+
+            val workDirAbs = depotFilesData.workDir.toResolvedFile().absolutePath
+            val fileId = fileWorkPath.toResolvedFile().absolutePath
+                .replace(workDirAbs, "")
+                .trimStart('/')
+                .replace("\\", "/")
+                .replace(".", "_")
+                .replace(" ", "_")
+
+            releaseOnExit = false
+
+            neededChunks.forEach { chunk ->
+                pendingChunks.incrementAndGet()
+                networkChunkFlow.tryEmit(
+                    NetworkChunkItem(
+                        downloadCounter = downloadCounter,
+                        depotFilesData = depotFilesData,
+                        fileStreamData = fileStreamData,
+                        fileData = file,
+                        chunk = chunk,
+                        totalChunksForFile = neededChunks.size,
+                        fileId = fileId,
+                    )
+                )
+            }
+        } finally {
+            if (releaseOnExit) {
+                stagingBudget?.release(file.totalSize)
+            }
         }
     }
 
@@ -1606,7 +1748,7 @@ class DepotDownloader @JvmOverloads constructor(
         ensureActive()
 
         // Create temporary file path for this chunk
-        val chunkTempDir = depot.installDir / STAGING_DIR / "chunks" / fileId
+        val chunkTempDir = depotFilesData.workDir / STAGING_DIR / "chunks" / fileId
         filesystem.createDirectories(chunkTempDir)
         val chunkTempPath = chunkTempDir / "${chunk.offset}_$chunkID.chunk"
 
@@ -1626,6 +1768,7 @@ class DepotDownloader @JvmOverloads constructor(
             fileStreamData = fileStreamData,
             chunk = chunk,
             fileId = fileId,
+            workDir = depotFilesData.workDir,
         )
 
         // Emit to decompression flow
@@ -1855,6 +1998,37 @@ class DepotDownloader @JvmOverloads constructor(
         }
     }
 
+    private suspend fun finalizeStagedFile(file: FileData, workPath: Path, finalPath: Path) {
+        try {
+            val src = workPath.toResolvedFile()
+            val dst = finalPath.toResolvedFile()
+            dst.parentFile?.mkdirs()
+
+            FileInputStream(src).use { input ->
+                FileOutputStream(dst).use { output ->
+                    val buf = ByteArray(4 * 1024 * 1024)
+                    var n: Int
+                    while (input.read(buf).also { n = it } != -1) {
+                        output.write(buf, 0, n)
+                    }
+                    output.fd.sync()
+                }
+            }
+
+            if (file.flags.contains(EDepotFileFlag.Executable)) {
+                dst.setExecutable(true)
+            }
+
+            try {
+                filesystem.delete(workPath)
+            } catch (e: Exception) {
+                logger?.debug("Failed to delete work file $workPath: ${e.message}")
+            }
+        } finally {
+            stagingBudget?.release(file.totalSize)
+        }
+    }
+
     private suspend fun processFileDecompress(item: DecompressItem) = withContext(Dispatchers.IO) {
         // Throw the cancellation exception if requested so that this task is marked failed
         ensureActive()
@@ -1869,8 +2043,9 @@ class DepotDownloader @JvmOverloads constructor(
 
         val file = item.file
         val fileFinalPath = depot.installDir / file.fileName
+        val fileWritePath = item.workDir / file.fileName
         val chunk = item.chunk
-        val chunkTempDir = depot.installDir / STAGING_DIR / "chunks" / item.fileId
+        val chunkTempDir = item.workDir / STAGING_DIR / "chunks" / item.fileId
 
         val writeOffset = file.chunks.filter { it.offset < chunk.offset }.sumOf { it.uncompressedLength.toLong() }
 
@@ -1894,7 +2069,7 @@ class DepotDownloader @JvmOverloads constructor(
             }
 
             // Write decompressed chunk at specific file offset using RandomAccessFile
-            RandomAccessFile(fileFinalPath.toResolvedFile(), "rw").use { randomAccessFile ->
+            RandomAccessFile(fileWritePath.toResolvedFile(), "rw").use { randomAccessFile ->
                 randomAccessFile.seek(writeOffset)
                 randomAccessFile.write(decompressedChunkBuffer)
             }
@@ -1933,10 +2108,23 @@ class DepotDownloader @JvmOverloads constructor(
                 )
             }
 
-            val remainingDownloads = item.fileStreamData.chunksDownloaded.decrementAndGet()
+            val remainingDownloads = item.fileStreamData.chunksToDownload.decrementAndGet()
 
             if (remainingDownloads == 0) {
                 logger?.debug("File ${file.fileName} successfully finalized")
+
+                if (stagingRoot != null) {
+                    finalizeStagedFile(file, fileWritePath, fileFinalPath)
+                    val finalizePct = synchronized(depotDownloadCounter) {
+                        depotDownloadCounter.bytesFinalized += file.totalSize
+                        if (depotDownloadCounter.completeDownloadSize > 0L) {
+                            depotDownloadCounter.bytesFinalized.toFloat() / depotDownloadCounter.completeDownloadSize
+                        } else {
+                            1f
+                        }
+                    }
+                    notifyListeners { it.onFileFinalized(depot.depotId, finalizePct.coerceIn(0f, 1f)) }
+                }
 
                 notifyListeners { listener ->
                     listener.onFileCompleted(

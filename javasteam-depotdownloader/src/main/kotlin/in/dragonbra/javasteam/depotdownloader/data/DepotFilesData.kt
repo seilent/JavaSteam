@@ -25,6 +25,7 @@ data class DepotFilesData(
     val depotDownloadInfo: DepotDownloadInfo,
     val depotCounter: DepotDownloadCounter,
     val stagingDir: Path,
+    val workDir: Path,
     val manifest: DepotManifest,
     val previousManifest: DepotManifest?,
     val filteredFiles: MutableList<FileData>,

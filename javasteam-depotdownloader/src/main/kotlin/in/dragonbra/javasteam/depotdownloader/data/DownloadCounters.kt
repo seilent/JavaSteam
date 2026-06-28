@@ -40,4 +40,5 @@ data class DepotDownloadCounter(
     var sizeDownloaded: Long = 0,
     var depotBytesCompressed: Long = 0,
     var depotBytesUncompressed: Long = 0,
+    var bytesFinalized: Long = 0,
 )

@@ -59,6 +59,8 @@ interface IDownloadListener {
      */
     fun onChunkCompleted(depotId: Int, depotPercentComplete: Float, compressedBytes: Long, uncompressedBytes: Long) {}
 
+    fun onFileFinalized(depotId: Int, depotPercentFinalized: Float) {}
+
     /**
      * Called when a depot finishes downloading.
      * Use this for printing summary like "Depot 228990 - Downloaded X bytes (Y bytes uncompressed)"
