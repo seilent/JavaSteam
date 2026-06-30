@@ -58,6 +58,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withContext
@@ -179,6 +180,8 @@ class DepotDownloader @JvmOverloads constructor(
     private val pendingChunks = AtomicInteger(0)
 
     private val stagingBudget: ByteBudget? = stagingRoot?.let { ByteBudget(maxStagingBytes) }
+    private val largeFileGate: Semaphore? = stagingRoot?.let { Semaphore(1) }
+    private val copyMutex: Mutex? = stagingRoot?.let { Mutex() }
 
     private var chunkProcessingJob: Job? = null
     private var decompressJob: Job? = null
@@ -258,20 +261,23 @@ class DepotDownloader @JvmOverloads constructor(
         }
 
         suspend fun release(n: Long) {
-            mutex.withLock {
+            val admitted = mutex.withLock {
                 used -= n
                 if (used < 0L) used = 0L
-                while (waiters.isNotEmpty()) {
-                    val (need, d) = waiters.first()
+                val ready = ArrayList<CompletableDeferred<Unit>>()
+                val iterator = waiters.iterator()
+                while (iterator.hasNext()) {
+                    if (used >= capacity) break
+                    val (need, d) = iterator.next()
                     if (used == 0L || used + need <= capacity) {
                         used += need
-                        waiters.removeFirst()
-                        d.complete(Unit)
-                    } else {
-                        break
+                        iterator.remove()
+                        ready.add(d)
                     }
                 }
+                ready
             }
+            admitted.forEach { it.complete(Unit) }
         }
     }
 
@@ -1598,7 +1604,8 @@ class DepotDownloader @JvmOverloads constructor(
             return@withContext
         }
 
-        stagingBudget?.acquire(file.totalSize)
+        val largeFile = file.totalSize > maxStagingBytes
+        if (largeFile) largeFileGate?.acquire() else stagingBudget?.acquire(file.totalSize)
         var releaseOnExit = true
         try {
             if (filesystem.exists(fileWorkPath)) {
@@ -1647,7 +1654,7 @@ class DepotDownloader @JvmOverloads constructor(
             }
         } finally {
             if (releaseOnExit) {
-                stagingBudget?.release(file.totalSize)
+                if (largeFile) largeFileGate?.release() else stagingBudget?.release(file.totalSize)
             }
         }
     }
@@ -1999,11 +2006,12 @@ class DepotDownloader @JvmOverloads constructor(
     }
 
     private suspend fun finalizeStagedFile(file: FileData, workPath: Path, finalPath: Path) {
-        try {
-            val src = workPath.toResolvedFile()
-            val dst = finalPath.toResolvedFile()
-            dst.parentFile?.mkdirs()
+        if (file.totalSize > maxStagingBytes) largeFileGate?.release() else stagingBudget?.release(file.totalSize)
+        val src = workPath.toResolvedFile()
+        val dst = finalPath.toResolvedFile()
+        dst.parentFile?.mkdirs()
 
+        val copyToExternal = {
             FileInputStream(src).use { input ->
                 FileOutputStream(dst).use { output ->
                     val buf = ByteArray(4 * 1024 * 1024)
@@ -2014,18 +2022,17 @@ class DepotDownloader @JvmOverloads constructor(
                     output.fd.sync()
                 }
             }
+        }
+        if (copyMutex != null) copyMutex.withLock { copyToExternal() } else copyToExternal()
 
-            if (file.flags.contains(EDepotFileFlag.Executable)) {
-                dst.setExecutable(true)
-            }
+        if (file.flags.contains(EDepotFileFlag.Executable)) {
+            dst.setExecutable(true)
+        }
 
-            try {
-                filesystem.delete(workPath)
-            } catch (e: Exception) {
-                logger?.debug("Failed to delete work file $workPath: ${e.message}")
-            }
-        } finally {
-            stagingBudget?.release(file.totalSize)
+        try {
+            filesystem.delete(workPath)
+        } catch (e: Exception) {
+            logger?.debug("Failed to delete work file $workPath: ${e.message}")
         }
     }
 
@@ -2047,7 +2054,7 @@ class DepotDownloader @JvmOverloads constructor(
         val chunk = item.chunk
         val chunkTempDir = item.workDir / STAGING_DIR / "chunks" / item.fileId
 
-        val writeOffset = file.chunks.filter { it.offset < chunk.offset }.sumOf { it.uncompressedLength.toLong() }
+        val writeOffset = chunk.offset
 
         try {
             logger?.debug("Processing chunk $chunkID for file ${file.fileName}")
