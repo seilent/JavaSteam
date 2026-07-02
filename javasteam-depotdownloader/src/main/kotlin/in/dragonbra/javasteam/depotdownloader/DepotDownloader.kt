@@ -1186,6 +1186,8 @@ class DepotDownloader @JvmOverloads constructor(
         val allFileNames = HashSet<String>(filesAfterExclusions.size)
 
         // Pre-process
+        val createdFinalDirs = HashSet<Path>()
+        val createdStagingDirs = HashSet<Path>()
         filesAfterExclusions.forEachIndexed { index, file ->
             if (index % 50 == 0) {
                 ensureActive() // Check cancellation periodically
@@ -1197,12 +1199,14 @@ class DepotDownloader @JvmOverloads constructor(
             val fileStagingPath = stagingDir / file.fileName
 
             if (file.flags.contains(EDepotFileFlag.Directory)) {
-                filesystem.createDirectories(fileFinalPath)
-                filesystem.createDirectories(fileStagingPath)
+                if (createdFinalDirs.add(fileFinalPath)) filesystem.createDirectories(fileFinalPath)
+                if (createdStagingDirs.add(fileStagingPath)) filesystem.createDirectories(fileStagingPath)
             } else {
                 // Some manifests don't explicitly include all necessary directories
-                filesystem.createDirectories(fileFinalPath.parent!!)
-                filesystem.createDirectories(fileStagingPath.parent!!)
+                val finalParent = fileFinalPath.parent!!
+                val stagingParent = fileStagingPath.parent!!
+                if (createdFinalDirs.add(finalParent)) filesystem.createDirectories(finalParent)
+                if (createdStagingDirs.add(stagingParent)) filesystem.createDirectories(stagingParent)
 
                 downloadCounter.completeDownloadSize += file.totalSize
                 depotCounter.completeDownloadSize += file.totalSize
@@ -1764,6 +1768,8 @@ class DepotDownloader @JvmOverloads constructor(
             sink.write(chunkBuffer, 0, downloaded)
         }
 
+        notifyListeners { it.onChunkDownloaded(downloaded.toLong()) }
+
         logger?.debug("Saved uncompressed chunk $chunkID to $chunkTempPath")
 
         // Return the chunk download item for the next stage in the pipeline
@@ -2015,11 +2021,25 @@ class DepotDownloader @JvmOverloads constructor(
             FileInputStream(src).use { input ->
                 FileOutputStream(dst).use { output ->
                     val buf = ByteArray(4 * 1024 * 1024)
+                    var pending = 0L
+                    var lastEmit = System.currentTimeMillis()
                     var n: Int
                     while (input.read(buf).also { n = it } != -1) {
                         output.write(buf, 0, n)
+                        pending += n.toLong()
+                        val now = System.currentTimeMillis()
+                        if (now - lastEmit >= 250L) {
+                            val delta = pending
+                            notifyListeners { it.onFileWriteProgress(delta) }
+                            pending = 0L
+                            lastEmit = now
+                        }
                     }
                     output.fd.sync()
+                    if (pending > 0L) {
+                        val delta = pending
+                        notifyListeners { it.onFileWriteProgress(delta) }
+                    }
                 }
             }
         }
